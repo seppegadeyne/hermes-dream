@@ -22,10 +22,13 @@ Learn from execution, safely. Every change must serve one of two goals:
 ## Hard rules
 
 - The model decides, code applies. The nightly agent has read-only tools and only writes
-  its apply plan as its final response (dream sessions have every write tool blocked). Every write to the setup goes through `guard.py` and happens in the
+  its apply plan as its final response (dream job runs with only the plugin's read-only toolset
+  plus a write-blocking hook; the tick authenticates the plan by nonce and execution id). Every write to the setup goes through `guard.py` and happens in the
   applier, heal or restore code; every change saves its before- and after-state first.
 - Never weaken the guardrails of plan §7 (denylist, caps, verification, rollback, circuit
   breaker) to make a feature work. A target on the denylist stays report-only.
+- The `pre_tool_call` hook fails closed in Hermes: it must do no I/O, catch everything and
+  return `None` for every session that is not the dream job (test: < 1 ms).
 - Hooks are observer-only, fail-open, constant time and record metadata only. No prompts, tool
   results, command text or arguments are stored unless screened and truncated.
 - Open Hermes databases read-only (`sqlite3` URI `mode=ro`).

@@ -1,8 +1,9 @@
-# hermes-dream: implementation plan (v2)
+# hermes-dream: implementation plan (v3)
 
 Status: plan, nothing built yet. Every section maps to GitHub issues; the issue is the unit of
 work, this file is the shared design. Update this file in the same PR when a decision changes.
-v2 folds in three reviews (safety, feasibility against Hermes v0.22.5, issue quality).
+v3 folds in two review rounds (security/adversarial, feasibility against Hermes v0.22.5,
+consistency); v2 folded in the first three.
 
 ## 1. Goal
 
@@ -14,7 +15,7 @@ Failing cron jobs are healed during the day.
 capture  (observer hooks, always on, metadata only)
 collect  (nightly script, no LLM)              -> payload.json
 gate     (wake the agent only for new actionable clusters)
-dream    (one agent turn, read-only tools)     -> apply-plan.json
+dream    (one agent turn, plugin read-only toolset) -> apply plan (final response)
 tick     (no-LLM script, every 15 min):
            applier  -> guard check -> apply -> change records
            heal     -> transient retry, pause/resume of own pauses
@@ -78,7 +79,7 @@ hermes-dream/
   lessons.py       lifecycle state machine, change records
   guard.py         denylist, caps, target locks, circuit breaker, mode, kill switch
   restore.py       hash-checked restore primitives per target
-  applier.py       validates apply-plan.json with guard.py, applies, writes change records
+  applier.py       authenticates the dream output, validates the apply plan with guard.py, applies, writes change records
   verify.py        verification runner
   heal.py          retry and pause logic
   tick.py          entry point of the 15-minute job: applier, heal, verify (daily)
@@ -145,27 +146,52 @@ evidence on stdout). Never empty stdout (that skips the run silently).
 
 ### 4.4 Dream (agent turn)
 
-Cron job bound to skill `hermes-dream:dream`, `enabled_toolsets: [file, skills]`, `max_turns: 30`,
-model pinned at install (operator's choice, shown by `--check`). Hermes' `file` toolset also
-contains `write_file` and `patch`, so the plugin registers a `pre_tool_call` hook that blocks
-every write tool (`write_file`, `patch`, `terminal`, `execute_code`, `skill_manage`, `memory`,
-`cronjob`, `send_message`, any `mcp__*`) in sessions of the dream job (session mapping, 4.1).
-A block counts as a guard veto (breaker, 7.3).
+Cron job bound to skill `hermes-dream:dream`, `deliver: local` (the plan never goes to chat),
+model pinned at install (`model`, `provider`, `pinned: true`; shown by `--check`).
+
+**The toolset is the real control.** Hermes' `file` toolset contains `write_file`/`patch` and
+`skills` contains `skill_manage`, and a per-job toolset list silently gets every enabled MCP
+server added unless it contains `no_mcp`. So the plugin registers its own toolset
+`hermes-dream-ro` with three read-only tools (`dream_read_payload`, `dream_read_skill`,
+`dream_read_lessons`) that can read only the plugin data dir and eligible skills, and the job
+runs with `enabled_toolsets: [hermes-dream-ro, no_mcp]`. No `delegate_task`, no `execute_code`,
+no generic `read_file` (no exfiltration of arbitrary files).
+
+**Second layer: a `pre_tool_call` hook.** Hermes fails `pre_tool_call` closed (a raising or
+slow hook blocks every tool call in every session), so the hook does no I/O: one
+`ctx.current_cron_execution()` read (public API, reaches tool and hook threads, `None` outside
+cron and for children), compared with the cached dream job id; anything else returns `None`
+immediately. Whole body in `try/except: return None`; a block always carries a message. Test:
+under 1 ms. In dream sessions it blocks every tool outside `hermes-dream-ro` and counts tool
+calls per execution, blocking after `dream_max_tool_calls` (default 40). There is no per-job
+`max_turns` in Hermes (the global `agent.max_turns` applies; `--check` shows it), so this
+counter is the turn budget.
 
 The agent does not write files. Its **final response** is the apply plan: one fenced ```json
-block with at most `max_applies` lessons. Hermes saves it to
-`cron/output/<dream-job>/<ts>.md`; the tick parses the newest unprocessed file, validates the
-schema and ignores anything outside the block. Each lesson:
+block (schema in section 11) with at most `max_applies` lessons. Hermes saves it to
+`cron/output/<dream-job>/<ts>.md` (header, `## Prompt`, `## Response`; mode 0600, 50 kept).
+
+**Plan authorship.** Any session with `write_file` could drop a forged file there, so the tick
+accepts a plan only when (1) it echoes the per-run nonce the gate wrote to plugin state and
+handed to the agent, (2) the file maps to a successful `executions.db` row of the dream job and
+its mtime is after that row started, and (3) the JSON comes from the `## Response` section
+(framing as in Hermes' `_archive_answer`), never the prompt half, which contains the skill and
+gate output. Exactly one fenced block; zero, several or malformed = run recorded as
+`no_plan`, nothing applied. Processed files are tracked by execution id. Each lesson:
 signature, target, exact change as verbatim old/new text (skill pitfall, cron prompt, wiki page,
 memory entry), reason, evidence references, how to verify. It applies nothing.
 
-Skill lessons are append-only into a `## Pitfalls (hermes-dream)` section with a size cap; no
-rewriting of existing skill text. Before adding one, the agent checks open lessons for an
-opposite instruction.
+Skill lessons are never free text. The agent fills a fixed template (`symptom`, `cause`,
+`fix`; each max 200 chars) and code renders it into a `## Pitfalls (hermes-dream)` section,
+each item wrapped in `<!-- hermes-dream:L-n sha256 -->` markers, under a header saying the
+section is auto-generated and must not be followed where it weakens safety. Slot validation
+rejects backticks, `!`, `${`, URLs, paths outside the skill, and security vocabulary
+(approval, config, token, secret, env, sudo, curl, wget, ssh, chmod, `| bash`). The agent checks
+open lessons for an opposite instruction before proposing one.
 
 ### 4.5 Applier (in the tick)
 
-Picks up the newest unprocessed dream output, screens every lesson text with `screen.py` (all
+Picks up the newest unprocessed, authenticated dream output (4.4), screens every lesson text with `screen.py` (all
 targets, memory and skill included), validates it with `guard.py`, then applies. `guard.py`
 also enforces "the next attempt must differ" (fingerprint of the change vs the signature's
 `tried` list). Targets whose issue is not merged yet (e.g. wiki before M4, memory before the
@@ -174,8 +200,8 @@ wiki-hint contract) are recorded as report-only:
 | Target | Apply | Change record |
 |---|---|---|
 | skill (agent-created local skills only) | Hermes' skill write API, ledgered; a write staged by `skills.write_approval` becomes state `waiting` | ledger entry id (found by skill + time in `.curator_ledger.jsonl`), own copy of before and after content + sha256 |
-| cron prompt (jobs in `cron_prompt_include`) | `cron.jobs.update_job` | old and new job fields |
-| wiki | file write per the vault `SCHEMA.md` (frontmatter, index line, log line), under the shared vault lock | before/after content + sha256 |
+| cron prompt (jobs in `cron_prompt_include`) | `cron.jobs.update_job` under the cron store lock; report-only when the job's toolsets include terminal, code or MCP, or `approvals.cron_mode` is `approve` (an injected prompt would run unattended) | old and new job fields |
+| wiki | file write per the vault `SCHEMA.md` into a dedicated folder (`dream_wiki_dir`, default `queries/dream/`), frontmatter `source: hermes-dream`, `trust: untrusted`; wiki-hint excludes such pages from hint injection and from its upkeep agent's instructions (wiki-hint issue); under the shared vault lock | before/after content + sha256 |
 | memory | wiki-hint's memory-edit CLI contract (entry-level, locked); without wiki-hint: report-only | entry-level change set |
 | cron schedule / deliver | never: report-only | - |
 
@@ -192,10 +218,18 @@ wiki-hint contract) are recorded as report-only:
   and never trigger a paused job unless its `paused_reason` carries the plugin's marker.
 - **Pause**: only jobs in `pause_include`, after `pause_after_failures` identical consecutive
   failures (verification runs excluded). The pause creates a heal record `H-<n>` and sets
-  `paused_reason = "hermes-dream:H-<n> ..."`; the next dream run sees it as a cluster. When a
+  `paused_reason = "hermes-dream:H-<n> ..."`; collect reads open `H-n` records and turns each into a cluster for the next dream run. When a
   lesson for that job is applied (state `verifying`), the tick resumes the job itself (own
   marker only) and triggers one verification run (`trigger_job`, counted against
-  `max_retries_per_day`). Never touch a job the operator paused.
+  `max_retries_per_day`). Never touch a job the operator paused. A pause counts as our own
+  only when it matches a stored `H-n` record (job id, `paused_at`, reason hash); the marker
+  string alone proves nothing.
+- Every trigger/pause is a compare-and-swap: under the cron store lock, re-read the job and
+  re-check state, live claim and pause record, then act (`trigger_job` itself un-pauses,
+  clears `paused_reason` and ignores live claims). Use `trigger_job` only, never `resume_job`
+  (that can add an uncounted catch-up run). Verification runs are the ones the tick triggers;
+  `trigger_job` stamps `manual_run_at`, which tells them apart.
+- The tick always exits 0 (a non-zero exit sends a "script failed" alert every 15 minutes).
 - **Retries** skip jobs with an open lesson (the verification runs are verify's job).
 - Skips the dream job, the tick job and wiki-hint's upkeep job.
 - In `shadow` mode heal records what it would do and acts on nothing.
@@ -203,7 +237,12 @@ wiki-hint contract) are recorded as report-only:
 
 ### 4.7 Verification and rollback (in the tick, once a day)
 
-Lifecycle: `applied | waiting -> verifying -> kept | rolled_back | inconclusive -> escalated`.
+Lifecycle: `applied -> verifying -> kept | rolled_back | inconclusive | conflict -> escalated`.
+`waiting` (staged by `skills.write_approval`, `pending_id` stored) becomes `verifying` when the
+pending write is approved, and closes as `rolled_back` when it is rejected or disappears.
+`applied` becomes `verifying` at the next tick after the write is confirmed on disk.
+Exposure for skills is counted from `skill_view` / skill-load events in the journal (capture
+records these as cheap ok events).
 
 - Window `verify_days` (skills, wiki, memory) or `verify_runs` real runs (cron).
 - Minimum exposure: at least `min_exposure` loads of the skill or real runs of the job. Less =
@@ -213,7 +252,10 @@ Lifecycle: `applied | waiting -> verifying -> kept | rolled_back | inconclusive 
 - Rollback with `restore.py`: restore only when the current state equals the recorded after-
   state (sha256, job fields, memory entries). Otherwise revert only our own hunk; if that is not
   possible, escalate as `conflict`. Skills via `tools.skill_ledger.rollback_entry(id)` after the
-  same check, falling back to the own before-copy (the ledger is trimmed at 5 MB).
+  same check, falling back to the own before-copy (the ledger is trimmed at 5 MB). Skill
+  pitfalls are found by their `hermes-dream:L-n` marker across all skills (survives curator
+  merges and renames); the file is re-hashed right before the atomic rename and again after,
+  a mismatch is `conflict`.
 - After a rollback the change joins the signature's `tried` list; the next attempt must differ;
   after `max_attempts` the signature is escalated.
 - Escalated items appear under "needs a human" in every morning report until the operator runs
@@ -232,8 +274,10 @@ journal page per ISO week (section 5). One renderer, message catalog en/nl.
 
 ### 4.9 Operator commands
 
-`/dream show|undo L-n|block L-n <reason>|retry L-n|pause|resume|status`, same on the CLI
-(`hermes dream ...`; `install`/`remove` CLI only). No agent needed: handlers call `restore.py`
+`/dream show|undo L-n|block L-n <reason>|retry L-n|pause|status`, same on the CLI
+(`hermes dream ...`). `resume` (clears both the kill switch and a tripped breaker), `install`
+and `remove` are CLI-only, so a chat user cannot re-arm the system after an injection tripped
+the breaker. No agent needed: handlers call `restore.py`
 and `guard.py` directly. In a multi-profile gateway plugin handlers get no profile binding:
 capture the home in `register()` and wrap the handler in `use_cron_store(home)` plus a home
 override. Gateway commands run for any authorised chat user: document it.
@@ -249,7 +293,7 @@ unavailable, the rest keeps working. Hold the vault lock shared with wiki-hint w
 
 ## 6. Multi-profile
 
-One dream job and one tick job per install with `homes: all` (like wiki-hint), global caps and
+One dream job and one tick job per install; with `homes: all` (like wiki-hint) they cover every profile, global caps and
 breaker, journal and change records per home. `homes: current` for single-profile installs.
 
 ## 7. Guardrails (`guard.py`, enforced in code)
@@ -271,12 +315,25 @@ heal `max_retries_per_day`. Vault lock wait: 30 s, then skip and retry next tick
 
 ### 7.3 Circuit breaker
 
-Stop applying (detect and report only) until `hermes dream resume` when any of: rollbacks
->= `breaker_rollbacks` (default 2) or >= 30% of decided lessons in 7 days; any guard veto of a
-denied target (possible injection); heal actions above `breaker_heal_actions` per day; an
-unreadable or corrupt state file (fall back to shadow, never "empty").
+Veto classes: `tool_block` (the dream agent tried a tool outside its toolset: logged, counted,
+trips only at `breaker_tool_blocks` per run, default 5); `denied_target` (a lesson in an
+authenticated plan targets the denylist: possible injection); `forged_plan` (an output file
+failed authentication); `screen_hit` (lesson text failed the screen or slot validation).
 
-### 7.4 Kill switch and screening
+Stop applying (detect and report only) until `hermes dream resume` (CLI) when any of: rollbacks
+>= `breaker_rollbacks` (default 2) or >= 30% of decided lessons in 7 days; any `denied_target`
+or `forged_plan`; `screen_hit` >= 2 in 7 days; `tool_block` over its threshold; heal actions
+above `breaker_heal_actions` per day; an unreadable or corrupt state file (fall back to shadow,
+never "empty").
+
+### 7.4 Environment checks
+
+`hermes dream install --check` and every tick refuse `autonomous` (fall back to shadow, say why)
+when `skills.inline_shell` is true (a pitfall with `` !`cmd` `` would run on every skill load).
+`--check` also warns when `approvals.cron_mode` is `approve` and shows the effective
+`agent.max_turns`.
+
+### 7.5 Kill switch and screening
 
 `hermes dream pause` sets a state flag checked before every write; both jobs are paused too. A
 run already in progress stops at its next check. `screen.py` quarantines secrets, injection
@@ -288,8 +345,8 @@ guarantee; the guard is the real protection.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `mode` | `shadow` | `shadow`, `autonomous`, `off` |
-| `homes` | `current` | `current` or `all` |
+| `mode` | `shadow` | `shadow`, `autonomous`, `off` (`off`: hooks record nothing, gate never wakes, tick does nothing) |
+| `homes` | `current` | `current` or `all` (one dream + one tick job per install either way) |
 | `window_days` / `min_occurrences` / `min_days` | 14 / 3 / 2 | corroboration |
 | `max_applies` | 5 | lessons per night |
 | `verify_days` / `verify_runs` | 3 / 3 | verification window |
@@ -305,6 +362,12 @@ guarantee; the guard is the real protection.
 | `retention_days` | 30 | journal |
 | `wiki_journal_path` | `queries/dream-journal-{year}-W{week}.md` | |
 | `pitfall_max_chars` | 2000 | per-skill size cap of the hermes-dream pitfall section |
+| `dream_max_tool_calls` | 40 | tool calls per dream run (the hook enforces it) |
+| `breaker_tool_blocks` | 5 | blocked tool attempts per dream run before the breaker trips |
+| `dream_schedule` | `0 3 * * *` | nightly dream job |
+| `report_hour` | 7 | local hour of the morning report and the daily verify pass |
+| `tick_deliver` | install origin | deliver target of the tick (reports) |
+| `dream_wiki_dir` | `queries/dream/` | vault folder for dream pages |
 | `language` | `en` | `en`, `nl` |
 
 Manifest: `manifest_version: 2`, `kind: standalone`, `requires_hermes: ">=0.21.6"` (every
@@ -338,7 +401,29 @@ SOUL" in logs -> guard veto, breaker trips, nothing written; (g) low exposure ->
 never kept; (h) rollback after a foreign edit -> own hunk only or conflict.
 CI: tests + `hermes plugins doctor . --ci` + `hermes plugins validate .`.
 
-## 11. Milestones and build order
+## 11. Schemas (versioned, each with a test fixture)
+
+All JSON carries `"schema": <name>` and `"version": 1`. The issue that first writes a schema
+defines it in `docs/schemas.md` with an example; later issues extend, never rename.
+
+- **payload** (`plugin-data/.../payload.json`, written by collect): `run_id`, `nonce`,
+  `generated_at`, `homes`, `clusters[]` = {`cluster_id` (signature fingerprint), `signature`,
+  `target_fp`, `class`, `count`, `days`, `first_seen`, `last_seen`, `jobs[]`, `tools[]`,
+  `skills[]`, `evidence[]` = {`kind`, `ref`}}, `open_lessons[]`, `tried{}`.
+- **apply plan** (agent final response): `nonce`, `lessons[]` = {`cluster_id`, `target` =
+  {`kind`: skill|cron_prompt|wiki|memory, `name`: skill name / job id / vault path / memory
+  entry text}, `change` (skill: `symptom`/`cause`/`fix`; cron_prompt and wiki: `old`/`new`
+  verbatim, `old` empty = append; memory: `add`/`replace`), `reason`, `verify`},
+  `report_only[]` (same shape, plus `why`). Code assigns `L-n`, never the agent.
+- **change record** (`lessons/L-n.json`): `lesson`, `state`, `target`, `before`, `after`
+  (content or fields, sha256), `ledger_id`, `pending_id`, `applied_at`, `verify` = {`window`,
+  `exposure`, `baseline`, `observed`}, `history[]`.
+- **heal record** (`heal/H-n.json`): `job_id`, `kind` (retry|pause), `execution_id`,
+  `paused_at`, `reason_hash`, `lesson` (when linked), `closed_at`, `outcome`.
+
+Memory changes use wiki-hint's "memory change set" (wiki-hint issue), referenced by id.
+
+## 12. Milestones and build order
 
 - **M1 Foundation**: spike, scaffold, test harness, state, screen.
 - **M2 Capture + collect**: capture, session mapping, cron denial check, collect (split), gate.

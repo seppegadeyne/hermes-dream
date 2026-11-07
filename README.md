@@ -34,7 +34,7 @@ heal (every 15 min, no model)
 It runs on its own. Guardrails instead of approvals: every change is reversible (hash-checked,
 so later edits by others are never overwritten), verified and rolled back when it does not
 help; a hard denylist enforced in code (config, `.env`, `SOUL.md`, `USER.md`, plugin code,
-deletions, sending messages, cron schedules); retries and pauses only for jobs you list; caps
+deletions, sending messages, cron schedule and deliver changes); cron prompt edits only for jobs you list; retries and pauses only for jobs you list; caps
 per night; a circuit breaker; `hermes dream pause` as kill switch. New installs start in
 `mode: shadow` (records what it would do, changes nothing).
 
