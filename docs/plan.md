@@ -6,16 +6,18 @@ decision changes.
 
 ## 1. Goal
 
-A Hermes plugin that turns yesterday's execution into reviewed lessons, every night:
+A Hermes plugin that makes a Hermes setup smarter on its own: it turns yesterday's execution
+into lessons, applies them, checks whether they helped and rolls back the ones that did not.
+Failing cron jobs are healed during the day.
 
 ```
 capture (hooks, always on, cheap)
   -> collect (nightly script, no LLM)
   -> gate (wake the agent only when there is work)
-  -> dream (one agent turn: cluster evidence into numbered proposals)
-  -> review (a human answers per proposal)
-  -> apply (through the regular memory/skill/wiki paths)
-  -> report (weekly: what the system learned and whether it helped)
+  -> dream (one agent turn: turn clusters into numbered lessons and apply them)
+  -> verify (next days/runs: did the failure stop? otherwise automatic rollback)
+  -> report (morning: what changed; weekly: what the system learned and whether it helped)
+heal (every 15 min, no LLM): transient retry, pause on repeated failure
 ```
 
 The "dreaming" idea comes from two places:
@@ -35,14 +37,24 @@ Hermes already covers parts of this and the plugin must not duplicate them:
 | `/journey` | Timeline of saved memory and skills | View only |
 
 hermes-dream fills the gap: learning from **execution** (crons, tool errors, blocked
-approvals, subagent failures) across **all sessions and profiles**, with a human gate, and
+approvals, subagent failures) across **all sessions and profiles**, autonomously with
+guardrails, and
 writing durable knowledge to an **llm-wiki** vault as well as to skills and memory.
 
-## 2. Non-goals
+## 2. Autonomy and non-goals
 
-- No autonomous self-modification. The plugin never edits a skill, memory file, wiki page,
-  cron prompt or config without a human "yes" to a numbered proposal (or Hermes'
-  `write_approval` queue, when the operator uses it).
+The system runs **fully autonomously**: it detects, decides, applies, verifies and rolls back on
+its own. The operator is informed after the fact (morning report) and can veto or roll back any
+change, but nothing waits for a "yes". Safety comes from guardrails (section 4.8), not from a
+human gate:
+
+- every change is reversible and recorded with its before-state;
+- every change has a verification window and is rolled back automatically when it did not help
+  or made things worse;
+- a hard denylist of targets the system may never touch;
+- caps per night and a global kill switch.
+
+Non-goals:
 - No fact store / vector DB / memory provider. The memory slot stays as the operator set it.
 - No cloud judge and no network calls from the scripts. The only model call is the agent turn
   in the nightly cron job, on the operator's configured model.
@@ -172,7 +184,7 @@ goes through the injection scanner, so evidence never travels via stdout. Empty 
 run silently, so the wrapper always prints one of the two. With `homes: all` the installer
 creates one job per profile.
 
-### 4.4 Dream (agent turn)
+### 4.4 Dream (agent turn: decide and apply)
 
 Cron job bound to skill `hermes-dream:dream` (plugin skills are namespaced by manifest name),
 `enabled_toolsets` limited to file and skills. The run is unattended (`approvals.cron_mode`
@@ -186,20 +198,22 @@ applies), so it must not need flagged commands; the installer `--check` warns ab
    to verify it worked;
 4. ends with a short report delivered to the operator's channel.
 
-It applies nothing. Unanswered proposals return after their cooldown.
+It then applies the changes itself (section 4.5), within the caps and guardrails, and records
+each one as an open "lesson under verification". The proposal format stays: it is the change
+record used for verification, rollback and the report.
 
-### 4.5 Review and apply
+### 4.5 Apply (autonomous) and operator override
 
-The operator answers in chat: `/dream yes L-17`, `/dream no L-18 <reason>`, `/dream show`.
-A slash-command handler has no agent to run tools with (in the gateway `dispatch_tool` gets no
-parent agent). So `/dream yes L-17` records the decision in state and then calls
-`ctx.inject_message(<apply prompt for L-17>, session_key=...)`; the session's agent applies it by
-following the `hermes-dream:dream` skill. Gateway injection needs
-`plugins.entries.hermes-dream.allow_gateway_injection: true`; README and `install --check` say so.
-Without an attached session (cron output, no gateway) the command only records the decision and
-tells the operator to run `/dream apply L-17` in a chat session. Register the command with an
-args hint and text argument mode so Telegram/Discord pass the rest of the line.
-The agent applies through the normal paths:
+The nightly agent applies changes directly through the paths below. The operator never has to
+answer, but can intervene in chat: `/dream show` (open lessons), `/dream undo L-17` (roll back
+now), `/dream block L-18 <reason>` (roll back and never retry this signature), `/dream pause`.
+These overrides need no agent: the handler restores the saved before-state itself (same code as
+the automatic rollback, section 4.8) and updates state, so they work in every gateway session
+without `allow_gateway_injection`. Register the command with an args hint and text argument
+mode so Telegram/Discord pass the rest of the line. The same actions exist on the CLI
+(`hermes dream undo|block|pause|resume|status`).
+
+The nightly agent applies through the normal paths:
 
 - skill: `skill_manage patch` (ledgered, respects `skills.write_approval`, curator can roll back);
 - memory: `memory` tool `patch`/`add` (respects `memory.write_approval`);
@@ -212,26 +226,78 @@ The agent applies through the normal paths:
 "no" adds the fingerprint to the reject list with the reason; a rejected signal comes back
 only if it reappears after `reject_reask_days` (default 90).
 
-### 4.6 Retry and replay (the "recover instead of restart" part)
+### 4.6 Self-healing: retry and replay (the "recover instead of restart" part)
 
-Narrow and opt-in, because a generic re-run can repeat side effects:
+A separate `no_agent` heal job runs every 15 minutes (no model, no cost). It reads
+`cron/executions.db` and the journal and acts on fresh failures of recurring jobs:
 
-- only recurring jobs listed in `settings.retry_jobs` (operator declares them idempotent);
-- only failures classified transient (HTTP 429, 5xx, provider overload, timeout) that
+- transient failures (429, 5xx, timeout, provider overload) after at least one API call: one
+  re-run via `trigger_job` after `retry_delay_minutes`;
+- side-effect safety: no re-run when the failed session already made a successful call to a
+  sending or mutating tool (send_message, email/MCP send tools, terminal commands, `gh` writes,
+  browser form submits; list in settings `side_effect_tools`), or when the job is in
+  `retry_exclude`; those become a lesson for the nightly run instead;
+- a job that failed the same way `pause_after_failures` times in a row (default 3) is paused
+  with `paused_reason` set by the plugin, and listed in the report; the nightly run tries a fix
+  and resumes it when the fix is applied;
+- every heal action is logged and verified like any other change.
+
+Former limits that still hold:
+- only failures classified transient for the re-run itself (HTTP 429, 5xx, provider overload, timeout) that
   `cron.retry_unreachable` does not already handle;
 - never when the failed run made zero API calls (that is `cron.retry_unreachable`'s case; test it);
 - at most one re-run per job per day, delayed `retry_delay_minutes` (default 20), via `trigger_job`;
 - every re-run is logged and appears in the morning report.
 
-Everything else is a proposal, not an automatic action. "Replay" means: the proposal links the
-failed execution (execution id, session id, output file) so the operator or agent can resume
-from the evidence instead of starting over.
+Everything else goes to the nightly dream run as a lesson. "Replay" means: every lesson links
+the failed execution (execution id, session id, output file) so the agent resumes from the
+evidence instead of starting over; when the nightly run fixed a job, it triggers one re-run of
+that job (`trigger_job`) as the first verification.
+
+### 4.8 Guardrails, verification and automatic rollback
+
+This replaces the human gate. Every applied change ("lesson") goes through the same lifecycle:
+
+```
+detected -> applied (before-state saved) -> verifying (N days) -> kept | rolled back
+```
+
+1. **Before-state**: skill writes go through `skill_manage` (ledgered; single-entry rollback with
+   `hermes curator rollback <entry-id>`); cron prompt/schedule changes save the old job fields in
+   the plugin state; wiki writes are recorded as file + sha256 before/after; memory writes go
+   through wiki-hint's locked `memory_edit.py` (backup per write) when installed, otherwise the
+   `memory` tool with the old text saved.
+2. **Verification window** (`verify_days`, default 3; for jobs: the next `verify_runs` runs,
+   default 3): the signature that triggered the lesson must drop (fewer occurrences than before,
+   and zero for job failures), and no **new** failure signature may appear in the same target
+   (same job, same skill's sessions, same tool).
+3. **Automatic rollback** when verification fails or a regression appears: restore the
+   before-state, mark the signature "tried: <change>" so the next attempt must be different,
+   and after `max_attempts` (default 2) failed fixes the signature is escalated: listed in the
+   report as "needs a human", the job stays paused if it was paused, no further attempts.
+4. **Kept** lessons stay; the weekly report lists them with before/after counts.
+5. **Denylist** (hard-coded, not configurable away): `SOUL.md`, `config.yaml` and `.env` of any
+   home, credentials and `~/.secrets`-style paths, plugin code (including this plugin), Hermes
+   source, `USER.md`, other repositories, deleting skills or wiki pages, deleting cron jobs,
+   anything that sends messages or mail on its own. Proposals for those are report-only.
+6. **Caps**: per night `max_applies` (default 5), per target one change per verification
+   window (no stacking changes on the same skill/job before the first is verified), heal job
+   `max_retries_per_day`.
+7. **Circuit breaker**: if more than `breaker_rollbacks` (default 3) rollbacks happen in 7 days,
+   the plugin stops applying (detect + report only) until `hermes dream resume`.
+8. **Kill switch**: `hermes dream pause` / `/dream pause` stops both jobs immediately.
+9. **Transparency**: every action lands in the morning report (delivered to the operator's
+   channel) and in the weekly wiki journal, with a ready `/dream undo L-n`.
+
+`mode` setting: `autonomous` (default, everything above), `shadow` (detect and write lessons as
+proposals but apply nothing; for trying it on a new install), `off`.
 
 ### 4.7 Weekly report
 
-Once a week: proposals made/applied/rejected, top recurring signatures, and for applied
-lessons whether the signature stopped (before/after counts). This is the measurement that
-shows whether the system really gets better.
+Once a week: lessons applied / kept / rolled back / escalated, heal actions (retries, pauses,
+resumes), top recurring signatures, and for kept lessons the before/after counts. Headline
+metric: failed cron runs and tool errors per week, trending down. This is the measurement that
+shows whether the setup really gets smarter on its own.
 
 ## 5. llm-wiki integration
 
@@ -266,15 +332,23 @@ Rules (mirror the llm-wiki conventions; read the vault's `SCHEMA.md` at runtime 
 | `min_occurrences` | 3 | cluster threshold (or `min_days`) |
 | `min_days` | 2 | distinct days threshold |
 | `max_proposals` | 5 | per night |
-| `cooldown_days` | 3 | before an unanswered proposal returns |
-| `reject_reask_days` | 90 | |
+| `mode` | `autonomous` | `autonomous`, `shadow` (proposals only) or `off` |
+| `max_applies` | 5 | changes per night |
+| `verify_days` | 3 | verification window for skill/wiki/memory lessons |
+| `verify_runs` | 3 | verification window (runs) for cron lessons |
+| `max_attempts` | 2 | different fixes per signature before escalation |
+| `breaker_rollbacks` | 3 | rollbacks in 7 days that stop applying |
+| `pause_after_failures` | 3 | identical consecutive job failures before the heal job pauses it |
+| `side_effect_tools` | send_message, terminal, ... | tools whose successful call blocks an automatic re-run |
+| `retry_exclude` | `[]` | job ids never re-run automatically |
+| `max_retries_per_day` | 1 | per job |
+| `cooldown_days` | 3 | before a deferred lesson is reconsidered |
+| `reject_reask_days` | 90 | after `/dream block`, or after escalation |
 | `retention_days` | 30 | event journal |
-| `retry_jobs` | `[]` | job ids allowed for transient re-run |
 | `retry_delay_minutes` | 20 | |
 | `wiki_journal_path` | `queries/dream-journal-{year}-W{week}.md` | |
 | `deliver` | job default | delivery target for the morning report |
 | `language` | `en` | report language (`en`, `nl`) |
-| `apply_enabled` | `false` | shadow mode until true: proposals only, `/dream yes` refuses |
 
 ## 7. Safety
 
@@ -282,7 +356,8 @@ Rules (mirror the llm-wiki conventions; read the vault's `SCHEMA.md` at runtime 
 - The capture hooks never raise; any exception is swallowed after one log line per hour.
 - Screening before anything leaves the journal (proposal, report, wiki, model context).
 - Caps per night, kill switch `hermes dream pause`, and `hermes dream status`.
-- The plugin never deletes curated content; reject and undo are state-only.
+- The plugin never deletes curated content, cron jobs or pages; rollbacks restore before-states.
+- Guardrails, denylist, verification and circuit breaker as in section 4.8.
 - Public repo: no private paths, hostnames, names or tokens in code, tests, docs or fixtures.
 
 ## 8. Manifest
@@ -297,8 +372,11 @@ used: `inject_message`, `register_skill`, `register_command`, `register_cli_comm
 - stdlib `unittest`, offline, no Hermes import for unit tests (load modules by path, fake ctx).
 - Fixtures: tiny generated `state.db`, `executions.db`, `jobs.json`, `errors.log`, a fake wiki
   vault with `SCHEMA.md`/`index.md`/`log.md`.
-- Golden test: two consecutive nights with the same failure produce one proposal, then a
-  cooldown, then a reject, then silence.
+- Golden tests: (a) a recurring failure -> lesson applied -> signature drops -> kept;
+  (b) lesson applied -> signature persists -> rollback -> second, different fix -> escalation;
+  (c) heal job: transient 429 -> one re-run; side-effect tool already called -> no re-run;
+  3 identical failures -> pause; (d) circuit breaker trips after N rollbacks;
+  (e) denylisted target is never written.
 - `hermes plugins doctor . --ci` and `hermes plugins validate .` in CI.
 
 ## 9. Coexistence and division of labour
@@ -313,13 +391,13 @@ only locked write path for `MEMORY.md`/`USER.md`). hermes-dream does **not** reb
 |---|---|---|
 | Wiki hygiene: index, broken links, frontmatter, tags, page size, `log.md` rotation, `raw/` hashes | wiki-hint | hermes-dream never audits or repairs the vault |
 | Memory pressure (85% target), near-duplicate entries, entries naming missing paths | wiki-hint | already in `maintenance.py` |
-| Unattended writes to `MEMORY.md`/`USER.md` | wiki-hint `memory_edit.py` | hermes-dream's apply step runs in an interactive session and uses the `memory` tool; it never writes these files from a cron run |
+| Unattended writes to `MEMORY.md` | wiki-hint `memory_edit.py` | hermes-dream's nightly run calls it (locked, backed up) when wiki-hint is installed; `USER.md` is denylisted |
 | Backups of vault and memory before edits | wiki-hint | |
 | Loss guard (memory shrank overnight) | wiki-hint (new issue) | idea from hermes-dreaming |
 | "Still relevant?" questions for old memory entries, with cooldowns | wiki-hint (new issue) | idea from hermes-dreaming |
 | Approval-queue awareness (`pending/memory`: staged = waiting) | wiki-hint (new issue) | idea from hermes-dreaming |
-| Execution capture (hooks), collect, clustering, proposals, review, apply, transient retry, weekly learning report | hermes-dream | |
-| New durable lessons that belong in the wiki | hermes-dream proposes, applies after "yes" following the vault's `SCHEMA.md` | the next wiki-hint upkeep run then audits those pages like any other |
+| Execution capture (hooks), collect, clustering, autonomous apply, verification, rollback, self-healing heal job, weekly learning report | hermes-dream | |
+| New durable lessons that belong in the wiki | hermes-dream writes them autonomously following the vault's `SCHEMA.md` | the next wiki-hint upkeep run then audits those pages like any other |
 
 The new wiki-hint items are filed as issues on the wiki-hint repo, not built here.
 
@@ -340,11 +418,12 @@ Schedule: the dream job runs nightly; wiki-hint's upkeep runs weekly. Keep them 
 
 - **M1 Foundation**: scaffold, state, screen, CI.
 - **M2 Capture + collect**: hooks, journal, collectors, payload, gate.
-- **M3 Dream + review**: skill, proposals, `/dream` command, apply paths, installer.
-- **M4 Wiki**: llm-wiki writer, journal page, apply-to-wiki.
-- **M5 Recover + measure**: transient retry, replay links, weekly report.
-- **M6 Release**: docs, catalog-ready validation, first live week in shadow mode.
+- **M3 Dream + apply**: skill, lessons, autonomous apply paths, `/dream` overrides, installer.
+- **M4 Wiki**: journal page, apply-to-wiki.
+- **M5 Self-heal + verify**: heal job (retry, pause, resume), verification, automatic rollback,
+  circuit breaker, replay links, weekly report.
+- **M6 Release**: docs, catalog-ready validation, first live week.
 
-Shadow mode (first release default): the nightly turn writes proposals and the report, but
-`/dream yes` is disabled until the operator sets `apply_enabled: true`. One week of shadow
-output is the acceptance test for the whole design.
+Release order: M5's verification and rollback must be merged before `mode: autonomous` is the
+default; until then builds ship with `mode: shadow`. The first live week runs autonomous with
+the guardrails; its report (applied, kept, rolled back) is the acceptance test.

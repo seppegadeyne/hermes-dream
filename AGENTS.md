@@ -21,8 +21,11 @@ Learn from execution, safely. Every change must serve one of two goals:
 
 ## Hard rules
 
-- Never write to skills, memory files, the wiki, cron jobs or config from scripts or hooks.
-  Writes happen only in the apply step after a human "yes", through Hermes' own tools.
+- Hooks and the collect script never write curated stores. Changes happen only in the nightly
+  apply step (agent, through Hermes' own tools), the heal job (retry/pause/resume via the cron
+  API) and rollbacks; every change saves its before-state first and goes through verification.
+- Never weaken the guardrails of plan §4.8 (denylist, caps, verification, rollback, circuit
+  breaker) to make a feature work. A target on the denylist stays report-only.
 - Hooks are observer-only, fail-open, constant time and record metadata only. No prompts, tool
   results, command text or arguments are stored unless screened and truncated.
 - Open Hermes databases read-only (`sqlite3` URI `mode=ro`).
