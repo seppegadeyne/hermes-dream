@@ -456,11 +456,11 @@ CI: tests + `hermes plugins doctor . --ci` + `hermes plugins validate .`.
 All JSON carries `"schema": <name>` and `"version": 1`. The issue that first writes a schema
 defines it in `docs/schemas.md` with an example; later issues extend, never rename.
 
-- **payload** (`plugin-data/.../payload.json`, written by collect): `run_id`, `nonce`,
+- **payload** (`plugin-data/.../payload.json`, written by collect): `run_id`,
   `generated_at`, `homes`, `clusters[]` = {`cluster_id` (signature fingerprint), `signature`,
   `target_fp`, `class`, `count`, `days`, `first_seen`, `last_seen`, `jobs[]`, `tools[]`,
   `skills[]`, `evidence[]` = {`kind`, `ref`}}, `open_lessons[]`, `tried{}`.
-- **apply plan** (agent final response): `nonce`, `lessons[]` = {`cluster_id`, `target` =
+- **apply plan** (agent final response, bound by response hash): `lessons[]` = {`cluster_id`, `target` =
   {`kind`: skill|cron_prompt|wiki|memory, `name`: skill name / job id / vault path / memory
   entry text}, `change` (skill: `symptom`/`cause`/`fix`; cron_prompt and wiki: `old`/`new`
   verbatim, `old` empty = append; memory: `add`/`replace`), `reason`, `verify`},
