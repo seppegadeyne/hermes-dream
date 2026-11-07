@@ -145,9 +145,17 @@ evidence on stdout). Never empty stdout (that skips the run silently).
 
 ### 4.4 Dream (agent turn)
 
-Cron job bound to skill `hermes-dream:dream`, read-only `enabled_toolsets` (file read, skills
-view), pinned `max_turns` and model. The agent reads the payload and the targets, then writes
-`apply-plan.json` (path handed over by the gate) with at most `max_applies` lessons. Each lesson:
+Cron job bound to skill `hermes-dream:dream`, `enabled_toolsets: [file, skills]`, `max_turns: 30`,
+model pinned at install (operator's choice, shown by `--check`). Hermes' `file` toolset also
+contains `write_file` and `patch`, so the plugin registers a `pre_tool_call` hook that blocks
+every write tool (`write_file`, `patch`, `terminal`, `execute_code`, `skill_manage`, `memory`,
+`cronjob`, `send_message`, any `mcp__*`) in sessions of the dream job (session mapping, 4.1).
+A block counts as a guard veto (breaker, 7.3).
+
+The agent does not write files. Its **final response** is the apply plan: one fenced ```json
+block with at most `max_applies` lessons. Hermes saves it to
+`cron/output/<dream-job>/<ts>.md`; the tick parses the newest unprocessed file, validates the
+schema and ignores anything outside the block. Each lesson:
 signature, target, exact change as verbatim old/new text (skill pitfall, cron prompt, wiki page,
 memory entry), reason, evidence references, how to verify. It applies nothing.
 
@@ -157,7 +165,11 @@ opposite instruction.
 
 ### 4.5 Applier (in the tick)
 
-Picks up a new `apply-plan.json`, validates every lesson with `guard.py`, then applies:
+Picks up the newest unprocessed dream output, screens every lesson text with `screen.py` (all
+targets, memory and skill included), validates it with `guard.py`, then applies. `guard.py`
+also enforces "the next attempt must differ" (fingerprint of the change vs the signature's
+`tried` list). Targets whose issue is not merged yet (e.g. wiki before M4, memory before the
+wiki-hint contract) are recorded as report-only:
 
 | Target | Apply | Change record |
 |---|---|---|
@@ -170,17 +182,23 @@ Picks up a new `apply-plan.json`, validates every lesson with `guard.py`, then a
 ### 4.6 Heal (in the tick)
 
 - **Retry**: only jobs in `retry_include` (default empty). Only transient classes (429, 5xx,
-  timeout) after at least one API call. Refused when the failed run made a successful
-  side-effect call (journal) or any non-read tool call, or has a delivery outcome other than
+  timeout) after at least one API call. Refused when the failed run made any successful call
+  to a tool matching `side_effect_tools` (journal; that setting is the definition, default
+  covers every sending, shell and MCP tool), or has a delivery outcome other than
   failed/suppressed. Only when the job is enabled, `state == scheduled`, has no live claim and
   no `quota_hold_until`. Waits `retry_delay_minutes` itself (`trigger_job` has no delay). Max
   `max_retries_per_day` per job, verification re-runs included.
 - `trigger_job` un-pauses and clears `paused_reason`: re-read the job right before triggering
   and never trigger a paused job unless its `paused_reason` carries the plugin's marker.
 - **Pause**: only jobs in `pause_include`, after `pause_after_failures` identical consecutive
-  failures (verification runs excluded), with `paused_reason = "hermes-dream:L-<n> ..."`.
-  Resume only own pauses, after a fix was applied. Never touch a job the operator paused.
-- Skips the dream job, the tick job, wiki-hint's upkeep job, and jobs with an open lesson.
+  failures (verification runs excluded). The pause creates a heal record `H-<n>` and sets
+  `paused_reason = "hermes-dream:H-<n> ..."`; the next dream run sees it as a cluster. When a
+  lesson for that job is applied (state `verifying`), the tick resumes the job itself (own
+  marker only) and triggers one verification run (`trigger_job`, counted against
+  `max_retries_per_day`). Never touch a job the operator paused.
+- **Retries** skip jobs with an open lesson (the verification runs are verify's job).
+- Skips the dream job, the tick job and wiki-hint's upkeep job.
+- In `shadow` mode heal records what it would do and acts on nothing.
 - Checks the paused flag and the target lock before every action.
 
 ### 4.7 Verification and rollback (in the tick, once a day)
@@ -202,6 +220,10 @@ Lifecycle: `applied | waiting -> verifying -> kept | rolled_back | inconclusive 
   `/dream block L-n` or `/dream retry L-n`.
 
 ### 4.8 Reports
+
+Sending: the tick is a `no_agent` job, and Hermes delivers its stdout to the job's deliver
+target. The tick prints the morning report once a day (and the weekly report on Mondays) when
+there is something to say, else nothing (silent run). The plugin itself never sends messages.
 
 Morning (only when something happened): applied, kept, rolled back, inconclusive, escalated,
 heal actions, guard vetoes, report-only proposals; each change with `/dream undo L-n`.
@@ -238,13 +260,14 @@ breaker, journal and change records per home. `homes: current` for single-profil
 (including this plugin), Hermes source, other repositories, bundled, hub and plugin-namespaced
 skills (only agent-created local skills are eligible), the `hermes-dream:dream` skill, the dream
 and tick jobs, wiki-hint's upkeep job and `MAINTENANCE.md`, deletions of skills, pages or jobs,
-cron schedule and deliver changes, anything that sends messages. Paths are resolved (symlinks)
+cron schedule and deliver changes, lessons that make a job or skill send messages. Paths are resolved (symlinks)
 before the check.
 
 ### 7.2 Caps and locks
 
 `max_applies` per night; one open lesson per target (one lock shared by applier, heal and
-verify); skill pitfall section size cap; heal `max_retries_per_day`.
+verify); skill pitfall section size cap (`pitfall_max_chars`, default 2000 per skill; full = report-only);
+heal `max_retries_per_day`. Vault lock wait: 30 s, then skip and retry next tick.
 
 ### 7.3 Circuit breaker
 
@@ -281,6 +304,7 @@ guarantee; the guard is the real protection.
 | `pause_after_failures` | 3 | heal |
 | `retention_days` | 30 | journal |
 | `wiki_journal_path` | `queries/dream-journal-{year}-W{week}.md` | |
+| `pitfall_max_chars` | 2000 | per-skill size cap of the hermes-dream pitfall section |
 | `language` | `en` | `en`, `nl` |
 
 Manifest: `manifest_version: 2`, `kind: standalone`, `requires_hermes: ">=0.21.6"` (every

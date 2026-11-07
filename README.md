@@ -15,7 +15,7 @@ heal (every 15 min, no model)
 
 - **Capture**: cheap observer hooks record failures as they happen (provider errors, tool
   errors, blocked or timed-out approvals, failed subagents), metadata only.
-- **Collect**: a nightly script with no LLM groups the last day of cron runs, `errors.log`
+- **Collect**: a nightly script with no LLM groups the last days (default window 14) of cron runs, `errors.log`
   and captured events into recurring signatures.
 - **Gate**: on a quiet night the cron job prints `{"wakeAgent": false}` and no model runs.
 - **Dream**: one agent turn with read-only tools turns the clusters into a few numbered

@@ -22,9 +22,9 @@ Learn from execution, safely. Every change must serve one of two goals:
 ## Hard rules
 
 - The model decides, code applies. The nightly agent has read-only tools and only writes
-  `apply-plan.json`. Every write to the setup goes through `guard.py` and happens in the
+  its apply plan as its final response (dream sessions have every write tool blocked). Every write to the setup goes through `guard.py` and happens in the
   applier, heal or restore code; every change saves its before- and after-state first.
-- Never weaken the guardrails of plan §4.8 (denylist, caps, verification, rollback, circuit
+- Never weaken the guardrails of plan §7 (denylist, caps, verification, rollback, circuit
   breaker) to make a feature work. A target on the denylist stays report-only.
 - Hooks are observer-only, fail-open, constant time and record metadata only. No prompts, tool
   results, command text or arguments are stored unless screened and truncated.
