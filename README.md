@@ -25,7 +25,7 @@ heal (every 15 min, no model)
 - **Verify**: over the next days or runs, a lesson must make its failure stop. If it does not,
   or something new breaks, it is rolled back automatically and a different fix is tried once;
   then it is escalated to you.
-- **Heal**: every 15 minutes, without a model, failed cron jobs get one re-run after a transient
+- **Heal** (opt-in per job): every 15 minutes, without a model, failed cron jobs get one re-run after a transient
   error (never when the run already sent or changed something) and are paused after repeated
   identical failures.
 - **Report**: every morning (what changed, with `/dream undo L-n`) and weekly (did the setup
