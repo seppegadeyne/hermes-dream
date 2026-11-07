@@ -1,7 +1,7 @@
 # hermes-dream
 
-Nightly "dreaming" for [Hermes Agent](https://github.com/NousResearch/hermes-agent): turn
-yesterday's execution logs into reviewed lessons.
+Nightly "dreaming" for [Hermes Agent](https://github.com/NousResearch/hermes-agent): your setup
+learns from its own execution logs, fixes what keeps failing, and rolls back what did not help.
 
 > Status: **planning**. Nothing is built yet. The design lives in [docs/plan.md](docs/plan.md)
 > and the work is split into GitHub issues (milestones M1-M6).
@@ -9,7 +9,8 @@ yesterday's execution logs into reviewed lessons.
 ## What it will do
 
 ```
-capture -> collect -> gate -> dream -> review -> apply -> report
+capture -> collect -> gate -> dream (decide) -> applier (guarded) -> verify -> report
+heal (every 15 min, no model)
 ```
 
 - **Capture**: cheap observer hooks record failures as they happen (provider errors, tool
@@ -17,8 +18,10 @@ capture -> collect -> gate -> dream -> review -> apply -> report
 - **Collect**: a nightly script with no LLM groups the last day of cron runs, `errors.log`
   and captured events into recurring signatures.
 - **Gate**: on a quiet night the cron job prints `{"wakeAgent": false}` and no model runs.
-- **Dream**: one agent turn turns the clusters into a few numbered lessons (a skill pitfall, a
-  cron prompt fix, a wiki page, a memory entry) and applies them through Hermes' own paths.
+- **Dream**: one agent turn with read-only tools turns the clusters into a few numbered
+  lessons (a skill pitfall, a cron prompt fix, a wiki page, a memory entry) in an apply plan.
+- **Apply**: plugin code, not the model, checks the plan against a hard denylist and caps and
+  applies it. The model decides; code applies.
 - **Verify**: over the next days or runs, a lesson must make its failure stop. If it does not,
   or something new breaks, it is rolled back automatically and a different fix is tried once;
   then it is escalated to you.
@@ -28,10 +31,12 @@ capture -> collect -> gate -> dream -> review -> apply -> report
 - **Report**: every morning (what changed, with `/dream undo L-n`) and weekly (did the setup
   get better?).
 
-It runs on its own. Guardrails instead of approvals: every change is reversible, verified and
-rolled back when it does not help; a hard denylist (config, `.env`, `SOUL.md`, `USER.md`,
-plugin code, deletions, sending messages); caps per night; a circuit breaker after repeated
-rollbacks; `hermes dream pause` as kill switch. `mode: shadow` makes it propose only.
+It runs on its own. Guardrails instead of approvals: every change is reversible (hash-checked,
+so later edits by others are never overwritten), verified and rolled back when it does not
+help; a hard denylist enforced in code (config, `.env`, `SOUL.md`, `USER.md`, plugin code,
+deletions, sending messages, cron schedules); retries and pauses only for jobs you list; caps
+per night; a circuit breaker; `hermes dream pause` as kill switch. New installs start in
+`mode: shadow` (records what it would do, changes nothing).
 
 ## Why not the built-ins?
 

@@ -21,15 +21,15 @@ Learn from execution, safely. Every change must serve one of two goals:
 
 ## Hard rules
 
-- Hooks and the collect script never write curated stores. Changes happen only in the nightly
-  apply step (agent, through Hermes' own tools), the heal job (retry/pause/resume via the cron
-  API) and rollbacks; every change saves its before-state first and goes through verification.
+- The model decides, code applies. The nightly agent has read-only tools and only writes
+  `apply-plan.json`. Every write to the setup goes through `guard.py` and happens in the
+  applier, heal or restore code; every change saves its before- and after-state first.
 - Never weaken the guardrails of plan §4.8 (denylist, caps, verification, rollback, circuit
   breaker) to make a feature work. A target on the denylist stays report-only.
 - Hooks are observer-only, fail-open, constant time and record metadata only. No prompts, tool
   results, command text or arguments are stored unless screened and truncated.
 - Open Hermes databases read-only (`sqlite3` URI `mode=ro`).
-- Runtime data goes to `plugin_data_dir("dream")`, never into the plugin directory.
+- Runtime data goes to `plugin_data_dir("hermes-dream")`, never into the plugin directory.
 - Atomic state writes; a corrupt state file is moved aside, never treated as empty.
 - No network calls from code. No new dependencies outside the Python standard library.
 - Public repo: no private paths, hostnames, personal names or tokens in code, tests, fixtures or
