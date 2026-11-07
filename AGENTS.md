@@ -51,3 +51,4 @@ Learn from execution, safely. Every change must serve one of two goals:
 
 - Python 3.11+, stdlib only, small modules, type hints, no global mutable state outside a lock.
 - English in code, docs and user-facing text; report language is a setting.
+- Read CONSTRAINTS.md before writing code. Never weaken it to make a change pass; tightening is fine.
